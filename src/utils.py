@@ -441,3 +441,170 @@ class TrainingMetrics:
                 f"Iter Time: {iter_time:.3f}s"
                 f"{eta_str}"
             )
+
+
+
+class InferencePerformanceTracker:
+    """Track inference performance metrics (latency, throughput, etc.)."""
+
+    def __init__(self, warmup_steps: int = 3):
+        """
+        Initialize inference performance tracker.
+        
+        Args:
+            warmup_steps (int): Number of warmup steps to skip before tracking metrics
+        """
+        self.warmup_steps = warmup_steps
+        self.reset()
+
+    def reset(self):
+        """Reset all tracking variables."""
+        self.prefill_start_time = None
+        self.prefill_end_time = None
+        self.decode_start_time = None
+        self.decode_times = []
+        self.num_generated_tokens = 0
+        self.step_count = 0
+        self.is_in_warmup = True
+        self.first_token_time = None
+        self.prefill_tokens = 0
+
+    def start_prefill(self, prompt_tokens: int):
+        """
+        Mark the start of prefill phase (processing the prompt).
+        
+        Args:
+            prompt_tokens (int): Number of tokens in the prompt
+        """
+        self.prefill_start_time = time.perf_counter()
+        self.prefill_tokens = prompt_tokens
+
+    def end_prefill(self):
+        """Mark the end of prefill phase."""
+        if self.prefill_start_time is not None:
+            self.prefill_end_time = time.perf_counter()
+
+    def start_decode(self):
+        """Mark the start of decode phase (generation)."""
+        if self.decode_start_time is None:
+            self.decode_start_time = time.perf_counter()
+
+    def step(self, num_tokens: int = 1) -> dict:
+        """
+        Update performance tracking for a decode step.
+        
+        Args:
+            num_tokens (int): Number of tokens generated in this step (usually 1)
+            
+        Returns:
+            dict: Performance metrics if past warmup, empty dict otherwise
+        """
+        self.step_count += 1
+        current_time = time.perf_counter()
+
+        # Track first token time
+        if self.first_token_time is None and self.decode_start_time is not None:
+            self.first_token_time = current_time - self.decode_start_time
+
+        # Track decode step time
+        if self.decode_start_time is not None and self.step_count > self.warmup_steps:
+            if len(self.decode_times) == 0:
+                # First decode step after warmup
+                step_time = current_time - self.decode_start_time
+            else:
+                # Subsequent steps
+                step_time = current_time - (self.decode_start_time + sum(self.decode_times))
+            
+            if step_time > 0:
+                self.decode_times.append(step_time)
+                self.num_generated_tokens += num_tokens
+
+        # Return metrics if past warmup
+        if self.step_count > self.warmup_steps and len(self.decode_times) > 0:
+            return self.get_metrics()
+        
+        return {}
+
+    def get_metrics(self) -> dict:
+        """
+        Get current performance metrics.
+        
+        Returns:
+            dict: Dictionary containing all performance metrics
+        """
+        metrics = {}
+        
+        # Prefill metrics
+        if self.prefill_start_time is not None and self.prefill_end_time is not None:
+            prefill_time = self.prefill_end_time - self.prefill_start_time
+            metrics["prefill_time"] = prefill_time
+            if prefill_time > 0:
+                metrics["prefill_tokens_per_second"] = self.prefill_tokens / prefill_time
+
+        # Decode metrics
+        if len(self.decode_times) > 0:
+            total_decode_time = sum(self.decode_times)
+            avg_time_per_token = total_decode_time / len(self.decode_times)
+            
+            metrics.update({
+                "time_to_first_token": self.first_token_time if self.first_token_time is not None else None,
+                "time_per_token": avg_time_per_token,
+                "tokens_per_second": 1.0 / avg_time_per_token if avg_time_per_token > 0 else 0.0,
+                "total_decode_time": total_decode_time,
+                "num_generated_tokens": self.num_generated_tokens,
+                "num_decode_steps": len(self.decode_times),
+            })
+
+        # Total generation metrics
+        if self.prefill_start_time is not None and len(self.decode_times) > 0:
+            total_time = (self.prefill_end_time if self.prefill_end_time else time.perf_counter()) - self.prefill_start_time
+            total_tokens = self.prefill_tokens + self.num_generated_tokens
+            metrics.update({
+                "total_time": total_time,
+                "total_tokens": total_tokens,
+                "overall_tokens_per_second": total_tokens / total_time if total_time > 0 else 0.0,
+            })
+
+        return metrics
+
+    def get_summary(self) -> str:
+        """
+        Get a formatted summary string of all metrics.
+        
+        Returns:
+            str: Formatted summary string
+        """
+        metrics = self.get_metrics()
+        if not metrics:
+            return "No metrics available yet."
+        
+        lines = []
+        lines.append("=" * 60)
+        lines.append("Inference Performance Summary")
+        lines.append("=" * 60)
+        
+        if "prefill_time" in metrics:
+            lines.append(f"Prefill Time: {metrics['prefill_time']:.4f}s")
+            if "prefill_tokens_per_second" in metrics:
+                lines.append(f"Prefill Throughput: {metrics['prefill_tokens_per_second']:.2f} tokens/s")
+        
+        if "time_to_first_token" in metrics and metrics["time_to_first_token"] is not None:
+            lines.append(f"Time to First Token (TTFT): {metrics['time_to_first_token']:.4f}s")
+        
+        if "time_per_token" in metrics:
+            lines.append(f"Time per Token (TPT): {metrics['time_per_token']:.4f}s")
+        
+        if "tokens_per_second" in metrics:
+            lines.append(f"Decode Throughput: {metrics['tokens_per_second']:.2f} tokens/s")
+        
+        if "num_generated_tokens" in metrics:
+            lines.append(f"Generated Tokens: {metrics['num_generated_tokens']}")
+        
+        if "total_time" in metrics:
+            lines.append(f"Total Time: {metrics['total_time']:.4f}s")
+            if "overall_tokens_per_second" in metrics:
+                lines.append(f"Overall Throughput: {metrics['overall_tokens_per_second']:.2f} tokens/s")
+        
+        lines.append("=" * 60)
+        
+        return "\n".join(lines)
