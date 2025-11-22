@@ -90,21 +90,8 @@ def generate_answer(
     use_cache: bool = True,
     tracker: Optional[InferencePerformanceTracker] = None,
 ) -> Tuple[str, dict]:
-    """
-    Generate an answer for a given prompt using model.generate().
     
-    Args:
-        model: The model to use for generation
-        tokenizer: Tokenizer for the model
-        prompt: Input prompt
-        max_new_tokens: Maximum number of tokens to generate
-        temperature: Sampling temperature (0.0 for greedy)
-        use_cache: Whether to use KV cache
-        tracker: Optional performance tracker
-        
-    Returns:
-        Tuple of (generated_text, performance_metrics)
-    """
+    past_key_values = None
     model.eval()
     
     # Get device from model parameters
@@ -113,58 +100,61 @@ def generate_answer(
     # Tokenize input
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     input_ids = inputs["input_ids"]
+    batch_size, initial_len = input_ids.shape
     prompt_length = input_ids.shape[1]
-    
-    # Generate using model.generate() - similar to main_inference.py
+    eos_token_id = model.config.eos_token_id
+
     with torch.no_grad():
-        generation_start = time.perf_counter()
-        
-        # Use model.generate() for simpler, more reliable generation
-        generate_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "use_cache": use_cache,
-            "do_sample": temperature > 0,
-        }
-        
-        if temperature > 0:
-            generate_kwargs["temperature"] = temperature
-        
-        outputs = model.generate(**inputs, **generate_kwargs)
-        
-        generation_end = time.perf_counter()
-        
-        # Track performance metrics (simplified since model.generate() is a black box)
-        if tracker:
-            tracker.reset()
-            total_time = generation_end - generation_start
-            num_generated = outputs.shape[1] - prompt_length
+        tracker.start_decode()
+        for step in range(256): # max_new_tokens
             
-            # Track overall metrics
-            tracker.start_prefill(prompt_length)
-            # Estimate: prefill typically takes ~5-10% of total time for long generations
-            estimated_prefill_time = total_time * 0.08 if num_generated > 5 else total_time * 0.2
-            tracker.prefill_start_time = generation_start
-            tracker.prefill_end_time = generation_start + estimated_prefill_time
-            tracker.end_prefill()
+            # 1. Prepare the input for the current step
+            if past_key_values is None:
+                # First pass: Process the FULL prompt (input_ids)
+                current_input_ids = input_ids
+            else:
+                # Subsequent passes: Process only the LAST token generated
+                current_input_ids = next_token # Use the token generated in the previous step
+
+            # 2. Call the model
+            outputs = model(
+                input_ids=current_input_ids, 
+                attention_mask=inputs.get('attention_mask'),
+                past_key_values=past_key_values if use_cache else None, # Pass the cache from the previous step
+                use_cache=use_cache # Explicitly request the model to return the cache
+            )
             
-            # Track decode
-            tracker.start_decode()
-            tracker.decode_start_time = generation_start + estimated_prefill_time
-            if num_generated > 0:
-                decode_time_per_token = (total_time - estimated_prefill_time) / num_generated
-                tracker.decode_times = [decode_time_per_token] * num_generated
-                tracker.num_generated_tokens = num_generated
-                tracker.first_token_time = estimated_prefill_time
-    
-    # Decode generated tokens (exclude prompt)
+            # 3. Update the cache for the next step
+            if use_cache:
+                past_key_values = outputs.past_key_values
+            
+            # 4. Process the logits
+            # For cached decoding, the logits are always for the *last* token in the sequence (the one just generated)
+            next_token_logits = outputs.logits[:, -1, :] 
+            tracker.step(len(next_token_logits))
+            
+            # 5. Select the next token
+            next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1) # shape (batch_size, 1)
+
+            # 6. Update input_ids (full sequence for tracking/output)
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+            
+            # 7. Update the attention mask (MUST be the full length)
+            if 'attention_mask' in inputs:
+                new_attention_mask = torch.ones((batch_size, 1), dtype=torch.long, device=input_ids.device)
+                inputs['attention_mask'] = torch.cat([inputs['attention_mask'], new_attention_mask], dim=-1)
+
+            # 8. Check for End-of-Sequence token
+            if (next_token == eos_token_id).all():
+                break
+        
     generated_text = tokenizer.decode(
-        outputs[0][prompt_length:], 
+        input_ids[0][prompt_length:], 
         skip_special_tokens=True
     )
-    
-    # Get performance metrics
+
     metrics = tracker.get_metrics() if tracker else {}
-    
+
     return generated_text, metrics
 
 
@@ -231,6 +221,7 @@ def evaluate_gsm8k(
         # Generate answer
         tracker = InferencePerformanceTracker(warmup_steps=0)
         start_time = time.perf_counter()
+
         
         generated_text, metrics = generate_answer(
             model=model,
