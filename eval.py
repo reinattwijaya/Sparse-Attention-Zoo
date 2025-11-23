@@ -22,6 +22,21 @@ from pathlib import Path
 from src.utils import load_from_checkpoint, InferencePerformanceTracker
 from src.dsa_llama_model import DSALlamaForCausalLM
 
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
+from src.dsa_llama_model import DSALlamaForCausalLM, DSALlamaConfig
+
+
+from src.utils import (
+    create_dsa_llama_model_from_scratch,
+    create_dsa_llama_model_pretrained,
+    PerformanceTracker,
+    get_model_flops_per_token,
+    load_from_checkpoint,
+    get_model_size_breakdown,
+    TrainingMetrics,
+)
+
 
 def extract_answer(text: str) -> Optional[float]:
     """
@@ -98,7 +113,7 @@ def generate_answer(
     device = next(model.parameters()).device
     
     # Tokenize input
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
     input_ids = inputs["input_ids"]
     batch_size, initial_len = input_ids.shape
     prompt_length = input_ids.shape[1]
@@ -106,7 +121,7 @@ def generate_answer(
 
     with torch.no_grad():
         tracker.start_decode()
-        for step in range(256): # max_new_tokens
+        for step in range(max_new_tokens): # max_new_tokens
             
             # 1. Prepare the input for the current step
             if past_key_values is None:
@@ -127,7 +142,7 @@ def generate_answer(
             # 3. Update the cache for the next step
             if use_cache:
                 past_key_values = outputs.past_key_values
-            
+
             # 4. Process the logits
             # For cached decoding, the logits are always for the *last* token in the sequence (the one just generated)
             next_token_logits = outputs.logits[:, -1, :] 
@@ -344,6 +359,11 @@ def main():
         default=None,
         help="Subfolder in HuggingFace repo (like 'run-1089676' in main_inference.py)",
     )
+    parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.2-1B")
+    parser.add_argument("--index_top_k", type=int, default=4096)
+    parser.add_argument("--index_num_heads", type=int, default=16)
+    parser.add_argument("--rope_head_dim", type=int, default=32)
+    parser.add_argument("--index_head_dim", type=int, default=64)
     
     # Evaluation arguments
     parser.add_argument(
@@ -426,12 +446,34 @@ def main():
     # Falls back to DSA-specific loading if needed
     try:
         from transformers import AutoModelForCausalLM
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_path,
-            subfolder=args.subfolder,
-            torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
-            low_cpu_mem_usage=True,
+
+        repo_id = "andresnowak/LLama-Deepseek-Sparse-Attention"
+        subfolder = "run-1089676"
+
+        # Download config.json from HuggingFace
+        config_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=f"{subfolder}/config.json",
         )
+        device = "cuda"
+        dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
+        config = DSALlamaConfig.from_pretrained(config_path)
+        config._attn_implementation = "eager"
+
+        # Initialize the model with the config
+        model = DSALlamaForCausalLM(config).to(dtype)
+
+        # Download and load the model weights (safetensors format)
+        model_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=f"{subfolder}/model.safetensors",
+        )
+
+        state_dict = load_file(model_path, device=device)
+
+        # Load the state dict into the model
+        model.load_state_dict(state_dict, strict=False)
     except Exception as e:
         # Fall back to DSA-specific loading for local checkpoints
         print(f"AutoModelForCausalLM failed ({e}), trying DSA-specific loading...")

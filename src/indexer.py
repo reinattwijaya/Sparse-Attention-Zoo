@@ -75,20 +75,21 @@ class Indexer(nn.Module):
             # Full RoPE: apply to all dimensions
             q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=2)
 
+        k = k.transpose(1, 2) # (batch, 1, seq_len, head_dim)
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            k, _ = past_key_values.update(k, torch.empty(0), self.indexer_cache_idx, cache_kwargs)
+            k, _ = past_key_values.update(k, torch.empty(0).to("cuda"), self.indexer_cache_idx, cache_kwargs)
 
         # 2. Reshape for multi-head processing
         # Reshape q to separate the heads
         batch, seq_len, _, _ = q.shape
         q = q.reshape(batch, seq_len, self.num_heads, self.head_dim) # (batch, seq_len, num_heads, head_dim)
         q = q.permute(0, 2, 1, 3) # (batch, num_heads, seq_len, head_dim)
-        k = k.transpose(1, 2) # (batch, 1, seq_len, head_dim)
 
         score = F.relu(q @ k.transpose(-2, -1)) # (batch, num_heads, seq_len, seq_len)
 
         indexer_score = (w.transpose(-2, -1).unsqueeze(-1) * score).sum(dim=1) # (batch, seq_len, seq_len), the logits
+        # print(indexer_score.shape)
 
         return indexer_score

@@ -44,7 +44,8 @@ def create_dsa_llama_model_pretrained(
     index_top_k: int,
     index_num_heads: int,
     rope_head_dim: int,
-    index_head_dim: int):
+    index_head_dim: int,
+    subfolder: str = None):
     # Load config with your custom parameters
     config = DSALlamaConfig.from_pretrained(
         model_path,         
@@ -62,6 +63,7 @@ def create_dsa_llama_model_pretrained(
     from transformers import LlamaForCausalLM
     pretrained_model = LlamaForCausalLM.from_pretrained(
         model_path,
+        subfolder=subfolder,
         torch_dtype=torch.bfloat16
     )
     

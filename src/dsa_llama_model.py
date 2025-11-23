@@ -13,6 +13,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 import torch.nn as nn
 import torch
+import copy
 import torch.nn.functional as F
 from typing import Optional, Union, Tuple
 from collections.abc import Callable
@@ -57,6 +58,8 @@ class DSALlamaConfig(LlamaConfig):
         self.index_num_heads = index_num_heads
         self.rope_head_dim = rope_head_dim
         self.index_head_dim = index_head_dim
+    def clone(self):
+        return copy.deepcopy(self)
 
 
 class LlamaDSA(LlamaAttention):
@@ -91,6 +94,11 @@ class LlamaDSA(LlamaAttention):
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2) # (batch_size, num_heads, seq_len, head_dim)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
+        num_query_heads = query_states.shape[1]
+        num_kv_heads = key_states.shape[1]
+        repetition_factor = num_query_heads // num_kv_heads
+        repetitions = (1, repetition_factor, 1, 1)
+
         cos, sin = position_embeddings
 
         # Indexer
@@ -109,6 +117,7 @@ class LlamaDSA(LlamaAttention):
         )
 
         # Apply sparse masking only during sparse training (not warmup)
+
         if not warmup_stage:
             with torch.no_grad():
                 if attention_mask is not None:
@@ -116,9 +125,7 @@ class LlamaDSA(LlamaAttention):
                     index_scores_masked = index_scores + causal_mask
                 else:
                     index_scores_masked = index_scores
-
-                _, top_k_indices = torch.topk(index_scores_masked, k=min(self.index_top_k, seq_len), dim=-1, sorted=False)
-
+                _, top_k_indices = torch.topk(index_scores_masked, k=min(self.index_top_k, index_scores_masked.shape[-1]), dim=-1, sorted=False)
                 sparse_mask = torch.full_like(index_scores_masked, -float("inf"))
                 sparse_mask = sparse_mask.scatter_(-1, top_k_indices, 0.0) # 0 for the top-k (active) entries; -inf for the rest (deactivated)
 
@@ -139,16 +146,43 @@ class LlamaDSA(LlamaAttention):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
+        # is_q_single = query_states.shape[-2] == 1
+        # B, H, L, E = key_states.shape
+
+        # if is_q_single:
+        #     active_mask = torch.eq(attention_mask[..., -1,:], 0.0)
+        #     active_mask = active_mask.repeat(1, key_states.shape[1], 1)
+        #     key_states = key_states[active_mask].reshape(B,H,-1,E)
+        #     value_states = value_states[active_mask].reshape(B,H,-1,E)
+
+
+        attn_weights = None
+
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
             key_states,
             value_states,
+            # attention_mask if not is_q_single else None,
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             **kwargs,
         )
+
+        # expanded_key_states = key_states.repeat(repetitions).contiguous()
+        # expanded_value_states = value_states.repeat(repetitions).contiguous()
+
+        # attn_output = F.scaled_dot_product_attention(
+        #     query_states,
+        #     key_states,
+        #     value_states,
+        #     attn_mask=attention_mask,
+        #     dropout_p=0.0 if not self.training else self.attention_dropout,
+        #     scale=self.scaling,
+        #     # is_causal=False, # Set this to True if your model is auto-regressive (decoder-only)
+        #     enable_gqa=True,
+        # )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
